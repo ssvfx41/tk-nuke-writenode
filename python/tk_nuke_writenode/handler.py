@@ -15,6 +15,7 @@ import pickle
 import datetime
 import base64
 import re
+import webbrowser
 
 import nuke
 import nukescripts
@@ -22,6 +23,12 @@ import nukescripts
 import tank
 from tank import TankError
 from tank.platform import constants
+
+try:
+    from software.nuke.nuke_python import nuke_tools as nt
+    ntools = nt.NukeTools()
+except:
+    nuke.tprint("Could not load studio tools")
 
 # Special exception raised when the work file cannot be resolved.
 class TkComputePathError(TankError):
@@ -34,9 +41,13 @@ class TankWriteNodeHandler(object):
     """
 
     SG_WRITE_NODE_CLASS = "WriteTank"
-    SG_WRITE_DEFAULT_NAME = "ShotgunWrite"
+    SG_WRITE_DEFAULT_NAME = "Version"
     WRITE_NODE_NAME = "Write1"
-
+    EMBED_META_DATA = "content_meta_data"    
+    EMBED_DELIVERY_REFORMAT = "delivery_reformat"
+    EMBED_SHUFFLE = "internal_shuffle"
+    EMBED_FORMAT_CROP = "format_crop"    
+    EMBED_MATTE_CLAMP = "matte_clamp"    
     OUTPUT_KNOB_NAME = "tank_channel"
     USE_NAME_AS_OUTPUT_KNOB_NAME = "tk_use_name_as_channel"
 
@@ -53,6 +64,7 @@ class TankWriteNodeHandler(object):
         # cache the profiles:
         self._promoted_knobs = {}
         self._profile_names = []
+        self._project_setting_groups = []
         self._profiles = {}
 
         self.__currently_rendering_nodes = set()
@@ -63,6 +75,37 @@ class TankWriteNodeHandler(object):
         self.__is_updating_proxy_path = False
 
         self.populate_profiles_from_settings()
+
+        self.sg = self._app.engine.shotgun
+        self.entity_info = self.sg.find_one(
+                                    "Shot", 
+                                    [['id', 'is', self._app.context.entity['id']]],
+                                    ['name',
+                                    'id',
+                                    'sg_main_plate',
+                                    'sg_shot_mattes',
+                                    'project.Project.name',
+                                    'project.Project.sg_frame_rate', 
+                                    'project.Project.sg_data_type',
+                                    'project.Project.sg_format_width',
+                                    'project.Project.sg_format_height',
+                                    'project.Project.sg_delivery_format_width',
+                                    'project.Project.sg_delivery_format_height',
+                                    'project.Project.sg_delivery_reformat_filter',
+                                    'project.Project.sg_delivery_reformat_type',                                            
+                                    'project.Project.sg_pixel_aspect_ratio',
+                                    'project.Project.sg_short_name',
+                                    'project.Project.sg_delivery_fileset',
+                                    'project.Project.sg_delivery_fileset_compression',
+                                    'project.Project.sg_color_space',
+                                    'project.Project.sg_project_color_management']
+                                )
+
+        self.proj_info = { k.split(".")[-1]: self.entity_info[k] for k in self.entity_info if "project.Project" in k }                                   
+        self.shot_info = { k: self.entity_info[k] for k in self.entity_info if "project.Project" not in k }                                   
+
+        self.ctx_info = self._app.context                                               
+        self.get_shot_frame_range()
 
     ################################################################################################
     # Properties
@@ -102,6 +145,11 @@ class TankWriteNodeHandler(object):
         """
         self._script_template = self._app.get_template("template_script_work")
 
+    def get_shot_frame_range(self):
+        if self._app.context.entity['type']  == "Shot":                                            
+            self.frame_range_app = self._app.engine.apps["tk-multi-setframerange"]
+            self.frame_range = self.frame_range_app.get_frame_range_from_shotgun()
+
     def get_nodes(self):
         """
         Returns a list of tank write nodes
@@ -114,6 +162,17 @@ class TankWriteNodeHandler(object):
             )
         else:
             return []
+
+    def get_nodes_by_class(self, class_name):
+        """
+        Returns a list of tank write nodes
+        """
+        if nuke.exists("root"):
+            return nuke.allNodes(group=nuke.root(), 
+                                 filter=class_name, 
+                                 recurseGroups = True)
+        else:
+            return []   
 
     def get_node_name(self, node):
         """
@@ -135,11 +194,11 @@ class TankWriteNodeHandler(object):
         if settings:
             return settings["tank_type"]
 
-    def get_render_template(self, node):
+    def get_render_template(self, node, write_type):
         """
         helper function. Returns the associated render template obj for a node
         """
-        return self.__get_render_template(node)
+        return self.__get_render_template(node,write_type)
 
     def get_publish_template(self, node):
         """
@@ -147,20 +206,19 @@ class TankWriteNodeHandler(object):
         """
         return self.__get_publish_template(node)
 
-    def get_proxy_render_template(self, node):
+    def get_proxy_render_template(self, node, write_type):
         """
         helper function. Returns the associated render proxy template obj for a node.
         If this hasn't been defined then it falls back to the regular render template.
         """
-        return self.__get_render_template(node, is_proxy=True, fallback_to_render=True)
+        return self.__get_render_template(node, write_type, is_proxy=True, fallback_to_render=True)
 
     def get_proxy_publish_template(self, node):
         """
         helper function. Returns the associated pub template obj for a node
         """
-        return self.__get_publish_template(node, True) or self.__get_publish_template(
-            node, False
-        )
+        return (self.__get_publish_template(node, True)
+                or self.__get_publish_template(node, False))
 
     def compute_render_path(self, node):
         """
@@ -216,7 +274,7 @@ class TankWriteNodeHandler(object):
         self.__update_render_path(node, force_reset=True, is_proxy=is_proxy)
         self.__update_render_path(node, force_reset=True, is_proxy=(not is_proxy))
 
-    def create_new_node(self, profile_name):
+    def create_new_node(self, profile_name, write_type):
         """
         Creates a new write node
 
@@ -236,23 +294,23 @@ class TankWriteNodeHandler(object):
             return
 
         # new node please!
-        node = nuke.createNode(TankWriteNodeHandler.SG_WRITE_NODE_CLASS)
+        node = nuke.createNode(TankWriteNodeHandler.SG_WRITE_NODE_CLASS, inpanel = False)
 
         # rename to our new default name:
-        existing_node_names = [n.name() for n in nuke.allNodes()]
-        postfix = 1
-        while True:
-            new_name = "%s%d" % (TankWriteNodeHandler.SG_WRITE_DEFAULT_NAME, postfix)
-            if new_name not in existing_node_names:
-                node.knob("name").setValue(new_name)
-                break
-            else:
-                postfix += 1
+        existing_node_names = [n.name() for n in nuke.allNodes(TankWriteNodeHandler.SG_WRITE_NODE_CLASS)]
+
+        new_name = self.__ensure_unique_name(TankWriteNodeHandler.SG_WRITE_DEFAULT_NAME,
+                                            existing_node_names)
+
+        node.knob("name").setValue(new_name)
 
         self._app.log_debug("Created Shotgun Write Node %s" % node.name())
 
         # set the profile:
-        self.__set_profile(node, profile_name, reset_all_settings=True)
+        # nuke.tprint(">>>>> FLAG AAAAA")
+        self.__set_profile(node, profile_name, write_type, reset_all_settings=True)
+
+        nuke.tprint( "Created %s Node %s" % ( node['tk_profile_list'].value(), node.name() ) )
 
         return node
 
@@ -289,8 +347,11 @@ class TankWriteNodeHandler(object):
                 except:
                     pass
 
+            # set the write type for creation of correct output
+            write_type = self.get_node_write_type_name(node)
+
             # create the node:
-            new_node = self.create_new_node(profile_name)
+            new_node = self.create_new_node(profile_name, write_type)
 
             # set the output:
             self.__set_output(new_node, output_name)
@@ -386,7 +447,44 @@ class TankWriteNodeHandler(object):
             self.__on_user_create, nodeClass=TankWriteNodeHandler.SG_WRITE_NODE_CLASS
         )
 
-    def convert_sg_to_nuke_write_nodes(self):
+def create_project_settings_group(self, node):
+        # Get properties of selected node to use for new group
+        nodePos = (node.xpos(), node.ypos())
+        existing_node_names = [n.name() for n in nuke.allNodes("Group")]
+        node_name = self.__ensure_unique_name("%s_Group" %(node['name'].value()), 
+                                                            existing_node_names)
+        # Primary group setup 
+        proj_group_nodes = []
+        project_group = nuke.createNode("Group", inpanel = False)
+        project_group['name'].setValue(node_name)
+        project_group_process = nuke.toNode(project_group['name'].value())
+        project_group_process.begin()
+        input_node = nuke.createNode("Input", inpanel = False) 
+        internal_shuffle = nuke.createNode("Shuffle", inpanel = False)
+        internal_shuffle['name'].setValue("internal_shuffle")
+        delivery_reformat = nuke.createNode("Reformat", inpanel = False)
+        delivery_reformat['name'].setValue("delivery_reformat")
+        format_crop = nuke.createNode("Crop", inpanel = False)
+        format_crop['name'].setValue("format_crop")        
+        content_metadata = nuke.createNode("ModifyMetaData", inpanel = False)       
+        content_metadata['name'].setValue("content_meta_data")     
+        matte_clamp = nuke.createNode("Clamp", inpanel = False)
+        matte_clamp['name'].setValue("matte_clamp")
+        output_node = nuke.createNode("Output", inpanel = False)        
+        proj_group_nodes.append(internal_shuffle)        
+        proj_group_nodes.append(delivery_reformat)
+        proj_group_nodes.append(format_crop)
+        proj_group_nodes.append(content_metadata)
+        proj_group_nodes.append(matte_clamp)
+        project_group_process.end()
+
+        project_group.setXpos(nodePos[0])
+        project_group.setYpos(nodePos[1] - 30)   
+        project_group.setSelected(False)
+
+        return project_group
+
+    def convert_sg_to_nuke_write_nodes(self, selected_node=None):
         """
         Utility function to convert all Shotgun Write nodes to regular
         Nuke Write nodes.
@@ -403,19 +501,65 @@ class TankWriteNodeHandler(object):
         """
         # clear current selection:
         nukescripts.clear_selection_recursive()
-
+        
+        sg_write_nodes =[]
         # get write nodes:
-        sg_write_nodes = self.get_nodes()
+        if not selected_node:
+            nuke.tprint("Converting all SG write nodes to Nuke write nodes.")
+            sg_write_nodes = self.get_nodes()
+        else:
+            nuke.tprint("Converting selected SG write nodes to Nuke write nodes.")            
+            sg_write_nodes.append(selected_node)
+
         for sg_wn in sg_write_nodes:
 
+            extra_node = None
             # set as selected:
             sg_wn.setSelected(True)
-            node_name = sg_wn.name()
+        #    node_name = sg_wn.name()
             node_pos = (sg_wn.xpos(), sg_wn.ypos())
-
+            
             # create new regular Write node:
-            new_wn = nuke.createNode("Write")
-            new_wn.setSelected(False)
+            with nuke.root():
+                new_wn = nuke.createNode("Write", inpanel = False )
+        #    new_wn.setSelected(False)
+        
+            if new_wn.input(0):
+                parent_node = new_wn.input(0)
+                extra_node = self.create_project_settings_group(sg_wn)   
+
+                parent_node = None
+                if sg_wn.input(0):
+                    parent_node = sg_wn.input(0)
+                extra_node.setInput(0, parent_node)
+                new_wn.setInput(0, extra_node)       
+                if not selected_node:            
+                    self._project_setting_groups.append(extra_node)
+
+            if not selected_node:            
+                node_name = sg_wn.name()
+            else:
+                node_name = sg_wn.name()+"_converted"
+
+            # Embed shuffle
+            extra_node.node('internal_shuffle')['disable'].setValue(sg_wn.node('internal_shuffle')['disable'].value())
+            # Embed reformat
+            extra_node.node('delivery_reformat')['disable'].setValue(sg_wn.node('delivery_reformat')['disable'].value())
+            extra_node.node('delivery_reformat')['filter'].setValue(sg_wn.node('delivery_reformat')['filter'].value())
+            extra_node.node('delivery_reformat')['resize'].setValue(sg_wn.node('delivery_reformat')['resize'].value())
+            extra_node.node('delivery_reformat')['format'].setValue(sg_wn.node('delivery_reformat')['format'].value())
+            extra_node.node('delivery_reformat')['pbb'].setValue(sg_wn.node('delivery_reformat')['pbb'].value())
+            extra_node.node('delivery_reformat')['black_outside'].setValue(sg_wn.node('delivery_reformat')['black_outside'].value())      
+            # Embed crop      
+            extra_node.node('format_crop')['disable'].setValue(sg_wn.node('format_crop')['disable'].value())
+            extra_node.node('format_crop')['box'].setValue(sg_wn.node('format_crop')['box'].value())
+            extra_node.node('format_crop')['reformat'].setValue(sg_wn.node('format_crop')['reformat'].value())
+            extra_node.node('format_crop')['crop'].setValue(sg_wn.node('format_crop')['crop'].value())
+
+            md = extra_node.node('content_meta_data')['metadata']
+            md.fromScript(self.__get_metadata(sg_wn))  
+            # Embed matte
+            extra_node.node('matte_clamp')['disable'].setValue(sg_wn.node('matte_clamp')['disable'].value())
 
             # copy across file & proxy knobs (if we've defined a proxy template):
             new_wn["file"].setValue(sg_wn["cached_path"].evaluate())
@@ -478,6 +622,25 @@ class TankWriteNodeHandler(object):
             )
             new_wn.addKnob(knob)
 
+            # channels
+            knob = nuke.String_Knob("tk_channel_cache")
+            knob.setValue(sg_wn["channels"].value())
+            new_wn.addKnob(knob)
+
+            # datatype
+            knob = nuke.String_Knob("tk_exr_datatype")
+            knob.setValue(sg_wn["exr_datatype"].value())
+            new_wn.addKnob(knob)
+
+            knob = nuke.String_Knob("tk_dpx_datatype")
+            knob.setValue(sg_wn["dpx_datatype"].value())
+            new_wn.addKnob(knob)
+
+            # autocrop
+            knob = nuke.String_Knob("tk_autocrop")
+            knob.setValue(str(sg_wn["auto_crop"].value()))
+            new_wn.addKnob(knob)
+
             # templates
             knob = nuke.String_Knob("tk_render_template")
             knob.setValue(sg_wn["render_template"].value())
@@ -494,6 +657,34 @@ class TankWriteNodeHandler(object):
             knob = nuke.String_Knob("tk_proxy_publish_template")
             knob.setValue(sg_wn["proxy_publish_template"].value())
             new_wn.addKnob(knob)
+
+            # Store tank_channel
+            knob = nuke.String_Knob("tk_tank_channel")
+            knob.setValue(sg_wn["tank_channel"].value())
+            new_wn.addKnob(knob)
+
+            #write type
+            knob = nuke.String_Knob("tk_write_type")
+            knob.setValue(sg_wn["write_type_cache"].value())
+            new_wn.addKnob(knob)
+
+            # project bool
+            knob = nuke.String_Knob("tk_project_format_cache")
+            if sg_wn["project_crop_bool"].value():
+                knob.setValue("True")
+            else:
+                knob.setValue("False")
+            new_wn.addKnob(knob)               
+
+            # Copy across colorspace
+            colorspace_name = r'default \((\w{1,9})\)'
+            colorspace_match = re.match(colorspace_name, sg_wn['colorspace'].value())
+            if colorspace_match:
+                new_wn['colorspace'].setValue(str(colorspace_match.group(1)))
+                nuke.tprint("Setting colorspace to %s" % colorspace_match.group(1))
+            else:
+                nuke.tprint("Setting colorspace to default")
+                new_wn['colorspace'].setValue(sg_wn['colorspace'].value())
 
             # delete original node:
             nuke.delete(sg_wn)
@@ -524,10 +715,23 @@ class TankWriteNodeHandler(object):
         write_nodes = nuke.allNodes(
             group=nuke.root(), filter="Write", recurseGroups=True
         )
-        for wn in write_nodes:
 
+        for gn in self._project_setting_groups:
+            nuke.tprint(gn)            
+            nuke.delete(gn)
+
+        self._project_setting_groups = []
+        
+        for wn in write_nodes:
+            if "_converted" in wn.name():
+                continue
+        
             # look for additional toolkit knobs:
             profile_knob = wn.knob("tk_profile_name")
+            write_type = wn.knob("tk_write_type")    
+            exr_datatype = wn.knob("tk_exr_datatype")
+            dpx_datatype = wn.knob("tk_dpx_datatype")
+            auto_crop = wn.knob("tk_autocrop")
             output_knob = wn.knob("tk_output")
             use_name_as_output_knob = wn.knob(
                 TankWriteNodeHandler.USE_NAME_AS_OUTPUT_KNOB_NAME
@@ -536,11 +740,17 @@ class TankWriteNodeHandler(object):
             publish_template_knob = wn.knob("tk_publish_template")
             proxy_render_template_knob = wn.knob("tk_proxy_render_template")
             proxy_publish_template_knob = wn.knob("tk_proxy_publish_template")
-
-            if (
-                not profile_knob
+            tk_tank_channel = wn.knob("tk_tank_channel")
+            project_format_knob = wn.knob("tk_project_format_cache")
+        
+            if (not profile_knob
                 or not output_knob
                 or not use_name_as_output_knob
+                or not write_type
+                or not exr_datatype
+                or not dpx_datatype     
+                or not auto_crop           
+                or not project_format_knob     
                 or not render_template_knob
                 or not publish_template_knob
                 or not proxy_render_template_knob
@@ -553,9 +763,10 @@ class TankWriteNodeHandler(object):
             wn.setSelected(True)
             node_name = wn.name()
             node_pos = (wn.xpos(), wn.ypos())
+            wn.setName(node_name)
 
             # create new Shotgun Write node:
-            new_sg_wn = nuke.createNode(TankWriteNodeHandler.SG_WRITE_NODE_CLASS)
+            new_sg_wn = nuke.createNode(TankWriteNodeHandler.SG_WRITE_NODE_CLASS, inpanel = False)
             new_sg_wn.setSelected(False)
 
             # copy across file & proxy knobs as well as all cached templates:
@@ -569,6 +780,7 @@ class TankWriteNodeHandler(object):
             new_sg_wn["proxy_publish_template"].setValue(
                 proxy_publish_template_knob.value()
             )
+            new_sg_wn["tk_channel_cache"].setValue(tk_tank_channel.value())
 
             # set the profile & output - this will cause the paths to be reset:
             # Note, we don't call the method __set_profile() as we don't want to
@@ -622,14 +834,97 @@ class TankWriteNodeHandler(object):
             # delete original node:
             nuke.delete(wn)
 
+            # set SG write type
+            write_type_name = write_type.value()
+            new_sg_wn["write_type"].setValue(write_type_name)     
+            
+            #Set tank channel
+            tank_channel_text = tk_tank_channel.value()
+            new_sg_wn["tank_channel"].setValue(tank_channel_text) 
+    
+            # datatype
+            new_sg_wn["exr_datatype"].setValue(exr_datatype.value())                     
+            new_sg_wn["dpx_datatype"].setValue(dpx_datatype.value())         
+
+            # autocrop
+            if auto_crop.value() == "True":
+                ac_val = True
+            else:
+                ac_val = False
+            new_sg_wn["auto_crop"].setValue(ac_val)  
+
+            # project format
+            if project_format_knob.value() == "True":
+                project_format_val = True
+            elif project_format_knob.value() == "False":
+                project_format_val = False
+
             # rename new node:
             new_sg_wn.setName(node_name)
             new_sg_wn.setXpos(node_pos[0])
             new_sg_wn.setYpos(node_pos[1])
 
+    def add_format(self, project_shortcode, format_type, format_width, format_height, pixel_aspect_ratio):
+        """
+        Test Nuke script for given format
+        Return if exact format is found
+        Create a new one and return if not found
+        """
+        format_name = "%s_%s_%d" % ( project_shortcode, format_type, format_width )
+        format_match = next((format_ for format_ in nuke.formats() if format_.name() == format_name),None)
+        if format_match:
+            if (format_match.width()== format_width and
+            format_match.height()== format_height and
+            format_match.pixelAspect() == pixel_aspect_ratio):
+                pass
+            else:
+                format_match = nuke.addFormat("%d %d %d %s" %(format_width, format_height, pixel_aspect_ratio, format_name))
+        else:
+            format_match = nuke.addFormat("%d %d %d %s" %(format_width, format_height, pixel_aspect_ratio,format_name))
+        
+        return format_match
+
     ################################################################################################
     # Public methods called from gizmo - although these are public, they should
     # be considered as private and not used directly!
+
+    def get_node_write_type_name(self, node):
+        """
+        Return the name of the profile the specified node is using
+        """
+        return node.knob("write_type").value()
+
+    def test_folder_for_renders(self, path):
+        """
+        Tests a given folder location - mainly the writenode's file path for containing files
+
+        :returns: True/False
+        """
+        file_path = ""
+        path_items = []
+        ext_match = []
+        path_dir = os.path.dirname(path)
+
+        if not os.path.isdir(path_dir):
+            return False
+
+        file_output_ext = []
+        path_items_ext = []
+        path_file_output_ext = os.path.split(path)
+        path_file_output_ext = os.path.splitext(path_file_output_ext[-1])[-1]
+        file_output_ext.append(path_file_output_ext)
+        path_items = os.listdir(path_dir)
+        path_items.sort()
+        if path_items:
+            for file in path_items:
+                path_item_ext = os.path.splitext(file)[1]
+                if path_item_ext not in path_items_ext:
+                    path_items_ext.append(path_item_ext)
+            
+            file_path = os.path.normpath(os.path.join(path_dir,path_items[0]))
+        ext_match = list(set(path_items_ext).intersection(set(file_output_ext)))
+
+        return (path_items, file_path, ext_match)
 
     def on_knob_changed_gizmo_callback(self):
         """
@@ -718,7 +1013,7 @@ class TankWriteNodeHandler(object):
             # render directory doesn't exist so try using location
             # of rendered frames instead:
             try:
-                files = self.get_files_on_disk(node)
+                files, fields = self.get_files_on_disk(node)
                 if len(files) == 0:
                     nuke.message(
                         "There are no %srenders for this node yet!\n"
@@ -773,8 +1068,71 @@ class TankWriteNodeHandler(object):
 
         # use Qt to copy the path to the clipboard:
         from sgtk.platform.qt import QtGui
-
         QtGui.QApplication.clipboard().setText(render_path)
+    
+    def on_copy_folder_to_clipboard_gizmo_callback(self):
+        """
+        Callback from the gizmo whenever the 'Copy path to clipboard' button
+        is pressed.
+        """
+        node = nuke.thisNode()
+        
+        # get the path depending if in full or proxy mode:
+        is_proxy = node.proxy()
+        render_path = self.__get_render_path(node, is_proxy)
+        try:
+            render_path = os.path.split(render_path)[0]
+        except:
+            self._app.log_debug("Could not get folder from path")
+        
+        # use Qt to copy the path to the clipboard:
+        from sgtk.platform.qt import QtGui
+        QtGui.QApplication.clipboard().setText(render_path)
+    
+    def on_open_in_player_gizmo_callback(self):
+        node = nuke.thisNode()
+        if not node:
+            return
+        
+        render_dir = None
+
+        # first, try to just use the current cached path:
+        is_proxy = node.proxy()
+        render_path = self.__get_render_path(node, is_proxy)
+        if render_path:
+            # the above method returns nuke style slashes, so ensure these
+            # are pointing correctly
+            render_path = render_path.replace("/", os.path.sep)
+            
+            dir_name = os.path.dirname(render_path)
+            if os.path.exists(dir_name):
+                render_dir = dir_name
+
+        if os.path.exists(os.path.normpath(self.software_info['windows_path'])):
+            if render_dir:
+                system = sys.platform
+                # run the app
+                if system == "linux2":
+                    pass
+                    # cmd = "xdg-open \"%s\"" % render_dir
+                elif system == "darwin":
+                    pass
+                    # cmd = "open '%s'" % render_dir
+                elif system == "win32":
+                    cmd = "start cmd.exe /c \"%s\" \"%s\" pause" % (self.software_info['windows_path'], render_dir)
+                else:
+                    raise Exception("Platform '%s' is not supported." % system)
+
+                self._app.log_debug("Executing command '%s'" % cmd)
+                exit_code = os.system(cmd)
+                if exit_code != 0:
+                    nuke.message("Failed to launch '%s'!" % cmd)
+
+            else:
+                nuke.message("Could not find the path to render")                    
+        else:
+            nuke.message("Could not find the path to %s: %s" % (self.software_info['code'],     
+                                                            self.software_info['windows_path']))
 
     def on_before_render_gizmo_callback(self):
         """
@@ -886,10 +1244,10 @@ class TankWriteNodeHandler(object):
 
         return self._app.get_template_by_name(template_name)
 
-    def __get_render_template(self, node, is_proxy=False, fallback_to_render=False):
+    def __get_render_template(self, node, write_type, is_proxy=False, fallback_to_render=False):
         """
         Get a specific render template for the current profile
-
+        
         :param is_proxy:            Specifies which of the two
         :param fallback_to_render:  If true and proxy template is null then the
                                     render template will be returned instead.
@@ -898,8 +1256,28 @@ class TankWriteNodeHandler(object):
             template = self.__get_template(node, "proxy_render_template")
             if template or not fallback_to_render:
                 return template
-
-        return self.__get_template(node, "render_template")
+        elif write_type == "Element":
+            template = self.__get_template(node, "element_render_template")
+            if template or not fallback_to_render:            
+                return template
+        elif write_type == "Denoise":
+            template = self.__get_template(node, "denoise_render_template")
+            if template or not fallback_to_render:            
+                return template
+        elif write_type == "SmartVector":
+            template = self.__get_template(node, "smartvector_render_template")
+            if template or not fallback_to_render:            
+                return template
+        elif write_type == "STMap":
+            template = self.__get_template(node, "stmap_render_template")
+            if template or not fallback_to_render:            
+                return template                
+        elif write_type == "Test":
+            template = self.__get_template(node, "test_render_template")
+            if template or not fallback_to_render:
+                return template    
+        else:
+            return self.__get_template(node, "render_template")
 
     def __get_publish_template(self, node, is_proxy=False):
         """
@@ -915,8 +1293,9 @@ class TankWriteNodeHandler(object):
         Determine if output key is used in either the render or the proxy render
         templates
         """
-        render_template = self.__get_render_template(node, is_proxy=False)
-        proxy_render_template = self.__get_render_template(node, is_proxy=True)
+        write_type = self.get_node_write_type_name(node)        
+        render_template = self.__get_render_template(node, write_type, is_proxy=False)
+        proxy_render_template = self.__get_render_template(node, write_type, is_proxy=True)
 
         for template in [render_template, proxy_render_template]:
             if not template:
@@ -950,7 +1329,7 @@ class TankWriteNodeHandler(object):
         output_is_used = self.__is_output_used(node)
         name_as_output = name_as_output_knob.value()
 
-        output_knob.setEnabled(output_is_used and not name_as_output)
+        # output_knob.setEnabled(output_is_used and not name_as_output)
         output_knob.setVisible(output_is_used)
         name_as_output_knob.setVisible(output_is_used)
 
@@ -958,11 +1337,14 @@ class TankWriteNodeHandler(object):
         """
         Updates the path preview fields on the tank write node.
         """
+        # set the write type for creation of correct output
+        write_type = self.get_node_write_type_name(node)
+
         # first set up the node label
         # this will be displayed on the node in the graph
         # useful to tell what type of node it is
         pn = node.knob("profile_name").value()
-        label = "Shotgun Write %s" % pn
+        label ="%s - %s" % (write_type, pn)
         self.__update_knob_value(node, "label", label)
 
         # get the render path:
@@ -985,12 +1367,51 @@ class TankWriteNodeHandler(object):
             # get the file name
             file_name = os.path.basename(norm_path)
             render_dir = os.path.dirname(norm_path)
+            # retrieve the correct context based on the dynamic
+            # file structure we have to separate out test 
+            # renders from primary ones
+            # get the current script path:
+            script_path = self.__get_current_script_path()
+            work_template = self._app.tank.template_from_path(script_path)
+            curr_fields = work_template.get_fields(script_path)
+            context_path = None
+
+            if self._app.context.entity['type'] == 'Shot':
+                fields ={
+                      'Shot': curr_fields['Shot'],
+                      'task_name': curr_fields['task_name'],
+                      'name': '',
+                      'output': '',
+                      'version': curr_fields['version']
+                }  
+                if write_type == "Test":
+                    context_info = self._app.tank.templates['shot_render_test_global']                       
+                else:
+                    context_info = self._app.tank.templates['shot_render_global']  
+
+                context_path = context_info.apply_fields(fields)      
+
+            elif self._app.context.entity['type'] == 'Asset':
+                fields ={
+                      'Asset': curr_fields['Asset'],
+                      'task_name': curr_fields['task_name'],
+                      'sg_asset_type': curr_fields['sg_asset_type'],
+                      'name': '',
+                      'output': '',
+                      'version': curr_fields['version']
+                }  
+                if write_type == "Test":
+                    context_info = self._app.tank.templates['asset_render_test_global']                       
+                else:
+                    context_info = self._app.tank.templates['asset_render_global']  
+
+                context_path = context_info.apply_fields(fields)   
 
             # now get the context path
-            context_path = None
-            for x in self._app.context.entity_locations:
-                if render_dir.startswith(x):
-                    context_path = x
+            # context_path = None
+            # for x in self._app.context.entity_locations:
+            #     if render_dir.startswith(x):
+            #         context_path = x
 
             if context_path:
                 # found a context path!
@@ -1058,7 +1479,7 @@ class TankWriteNodeHandler(object):
         # update the node:
         self.__populate_format_settings(node, file_type, file_settings)
 
-    def __set_profile(self, node, profile_name, reset_all_settings=False):
+    def __set_profile(self, node, profile_name, write_type, reset_all_settings=False):
         """
         Set the current profile for the specified node.
 
@@ -1098,17 +1519,56 @@ class TankWriteNodeHandler(object):
         # pull settings from profile:
         render_template = self._app.get_template_by_name(profile["render_template"])
         publish_template = self._app.get_template_by_name(profile["publish_template"])
-        proxy_render_template = self._app.get_template_by_name(
-            profile["proxy_render_template"]
-        )
-        proxy_publish_template = self._app.get_template_by_name(
-            profile["proxy_publish_template"]
-        )
+        proxy_render_template = self._app.get_template_by_name(profile["proxy_render_template"])
+        proxy_publish_template = self._app.get_template_by_name(profile["proxy_publish_template"])
+        element_render_template = self._app.get_template_by_name(profile["element_render_template"])
+        denoise_render_template = self._app.get_template_by_name(profile["denoise_render_template"])
+        smartvector_render_template = self._app.get_template_by_name(profile["smartvector_render_template"])
+        test_render_template = self._app.get_template_by_name(profile["test_render_template"])
+
         file_type = profile["file_type"]
         file_settings = profile["settings"]
         tile_color = profile["tile_color"]
         promote_write_knobs = profile.get("promote_write_knobs", [])
 
+        # Sets project specific data type
+        exr_datayype = '16 bit half'
+        dpx_datatype = '10 bit'
+
+        # convert SG value to Nuke value
+        if profile_name == "Exr":
+            if self.proj_info['sg_data_type']:
+                if self.proj_info['sg_data_type'] == '16 bit':
+                    exr_datayype = '16 bit half'
+                elif self.proj_info['sg_data_type'] == '32 bit':
+                    exr_datayype = '32 bit float'
+        elif profile_name == "Dpx":
+            if self.proj_info['sg_data_type']:            
+                self.__update_knob_value(node, 'dpx_datatype', self.proj_info['sg_data_type'])
+                file_settings.update({'datatype' : self.proj_info['sg_data_type']})     
+                nuke.tprint("Set datatype to %s" % self.proj_info['sg_data_type'])           
+            else:
+                self.__update_knob_value(node, 'dpx_datatype', dpx_datatype)
+        
+        # Apply datatype info based on context
+        if file_type == "exr" and write_type == "Version":
+            self.__update_knob_value(node, 'exr_datatype', exr_datayype)
+            file_settings.update({'compression' : 'none'})
+            file_settings.update({'datatype' : exr_datayype})
+        elif (file_type == "exr" and write_type == "Element" or 
+        write_type == "Denoise"):
+            self.__update_knob_value(node, 'exr_datatype', '16 bit half')
+            file_settings.update({'compression' : 'Zip (1 scanline)'})
+            file_settings.update({'datatype' : '16 bit half'})
+            nuke.tprint("Applying ZIP compression to %s output." % write_type)
+        elif write_type == "SmartVector":
+            self.__update_knob_value(node, 'exr_datatype', '16 bit half')            
+            file_settings.update({'datatype' : '16 bit half'})        
+        elif write_type == "STMap":
+            self.__update_knob_value(node, 'exr_datatype', '32 bit float')            
+            file_settings.update({'datatype' : '32 bit float'})
+
+        promote_write_knobs = profile.get("promote_write_knobs", [])
         # Make sure any invalid entries are removed from the profile list:
         list_profiles = node.knob("tk_profile_list").values()
         if list_profiles != self._profile_names:
@@ -1116,12 +1576,17 @@ class TankWriteNodeHandler(object):
 
         # update both the list and the cached value for profile name:
         self.__update_knob_value(node, "profile_name", profile_name)
+        self.__update_knob_value(node, "write_type_cache", write_type) 
         self.__update_knob_value(node, "tk_profile_list", profile_name)
 
         # set the format
         self.__populate_format_settings(
-            node, file_type, file_settings, reset_all_settings, promote_write_knobs,
-        )
+                                        node,
+                                        file_type,
+                                        file_settings,
+                                        reset_all_settings,
+                                        promote_write_knobs,
+                                    )
 
         # cache the type and settings on the root node so that
         # they get serialized with the script:
@@ -1179,16 +1644,18 @@ class TankWriteNodeHandler(object):
         # write the template name to the node so that we know it later
         self.__update_knob_value(node, "render_template", render_template.name)
         self.__update_knob_value(node, "publish_template", publish_template.name)
-        self.__update_knob_value(
-            node,
-            "proxy_render_template",
-            proxy_render_template.name if proxy_render_template else "",
-        )
-        self.__update_knob_value(
-            node,
-            "proxy_publish_template",
-            proxy_publish_template.name if proxy_publish_template else "",
-        )
+        self.__update_knob_value(node, "proxy_render_template", 
+                                 proxy_render_template.name if proxy_render_template else "")
+        self.__update_knob_value(node, "proxy_publish_template", 
+                                 proxy_publish_template.name if proxy_publish_template else "")
+        self.__update_knob_value(node, "element_render_template", 
+            element_render_template.name)
+        self.__update_knob_value(node, "denoise_render_template", 
+            denoise_render_template.name)
+        self.__update_knob_value(node, "smartvector_render_template", 
+            smartvector_render_template.name)
+        self.__update_knob_value(node, "test_render_template", 
+            test_render_template.name)
 
         # If a node's tile_color was defined in the profile then set it:
         if not tile_color or len(tile_color) != 3:
@@ -1203,7 +1670,19 @@ class TankWriteNodeHandler(object):
                 )
 
             # reset tile_color knob value back to default:
-            default_value = int(node["tile_color"].defaultValue())
+            if write_type == "Element":
+                default_value = 1095751564801
+            elif write_type == "Denoise":
+                default_value = 2231304447
+            elif write_type == "SmartVector":
+                default_value = 4278254335
+            elif write_type == "STMap":
+                default_value = 2857762815L
+            elif write_type == "Test":
+                default_value = 4278190081          
+            else:
+                default_value = int(node["tile_color"].defaultValue())
+
             self.__update_knob_value(node, "tile_color", default_value)
         else:
             # build packed RGB
@@ -1214,11 +1693,241 @@ class TankWriteNodeHandler(object):
 
             self.__update_knob_value(node, "tile_color", packed_rgb)
 
+        # set the channel info based on the profile type
+        profile_channel = "rgba"
+
+        context = self._app.context.entity['type']
+        if context != 'Asset':
+            if not self.shot_info['sg_shot_mattes']:
+                profile_channel = "rgb"
+            else:
+                nuke.tprint("Found assigned mattes on SG. Setting channels to all")
+                profile_channel = "all"
+        else:
+            pass
+    
+        if profile_name == "Dpx":
+            node.knob('dpx_datatype').setVisible(True)            
+            node.knob('exr_datatype').setVisible(False)   
+            node.knob('auto_crop').setVisible(False)
+            node.knob('auto_crop').setValue(False)            
+            profile_channel = "rgb"
+        elif profile_name == "Exr":
+            node.knob('exr_datatype').setVisible(True)
+            node.knob('dpx_datatype').setVisible(False)
+
+            try:
+                if node['channels_cache'].value() != "":
+                    profile_channel = node['channels_cache'].value()
+            except:
+                pass
+
+            node.node(TankWriteNodeHandler.WRITE_NODE_NAME)['metadata'].setValue('all metadata')
+            node.knob('auto_crop').setVisible(False)
+
+            if write_type in [ "Element", "SmartVector", "STMap" ]:
+                profile_channel = "all"
+                node.knob('auto_crop').setVisible(True)
+                node.knob('auto_crop').setValue(True)
+                node.node("Write1").knob("autocrop").setValue(True)
+           
+        elif profile_name == "Jpeg":
+            node.knob('dpx_datatype').setVisible(False)            
+            node.knob('exr_datatype').setVisible(False)   
+            node.knob('auto_crop').setVisible(False)                           
+        else:
+            nuke.tprint("No profile with that name")   
+        
+        self.__update_knob_value(node, "channels", profile_channel)
+
+        # Sets project specific fileset compression
+        if (file_type== "exr" and 
+            write_type == "Version"): #and 
+            # self.ctx_info.step['id'] != 3):
+            if self.proj_info['sg_delivery_fileset_compression']:
+                node.node("Write1").knob("compression").setValue(self.proj_info['sg_delivery_fileset_compression'])
+
+        if self._app.context.entity['type'] == 'Shot':
+            # Update embeded time code
+            delivery_reformat = node.node(TankWriteNodeHandler.EMBED_DELIVERY_REFORMAT)
+            internal_shuffle = node.node(TankWriteNodeHandler.EMBED_SHUFFLE)
+            format_crop = node.node(TankWriteNodeHandler.EMBED_FORMAT_CROP)            
+            content_meta_data = node.node(TankWriteNodeHandler.EMBED_META_DATA)        
+            matte_clamp = node.node(TankWriteNodeHandler.EMBED_MATTE_CLAMP)
+            proj_fps = self.proj_info['sg_frame_rate']
+
+            # Set the embeded delivery reformat 
+            if not (self.proj_info['sg_delivery_format_width'] and 
+            self.proj_info['sg_delivery_format_height']):
+                delivery_reformat['disable'].setValue(True)  
+                node.node("format_crop")['disable'].setValue(True)                  
+            else:       
+                if (self.proj_info['sg_delivery_format_width'] == self.proj_info['sg_format_width']
+                and self.proj_info['sg_delivery_format_height'] == self.proj_info['sg_format_height']):
+                    nuke.tprint("Delvery Format is the same as Project Format - disabling!")
+                    delivery_reformat['disable'].setValue(True)  
+                    node.node("format_crop")['disable'].setValue(True)                  
+                else:
+                    # Set the project reformat first
+                    delivery_format = self.add_format(self.proj_info['sg_short_name'],
+                                                    "delivery",
+                                                    int(self.proj_info['sg_delivery_format_width']), 
+                                                    int(self.proj_info['sg_delivery_format_height']), 
+                                                    int(self.proj_info['sg_pixel_aspect_ratio']))
+                        
+                    if write_type != "Version":
+                        delivery_reformat['disable'].setValue(True)
+                        node.node("format_crop")['disable'].setValue(True)
+                    else:
+                        # Add SG reformat settings
+                        filter_match = next((f for f in delivery_reformat['filter'].values() if f == self.proj_info['sg_delivery_reformat_filter']), None)
+                        if filter_match:
+                            delivery_reformat['filter'].setValue(filter_match)                                           
+                        resize_match = next((r for r in delivery_reformat['resize'].values() if r == self.proj_info['sg_delivery_reformat_type']), None)
+                        if resize_match:
+                            delivery_reformat['resize'].setValue(resize_match)
+                        # Set the delivery_reformat node
+                        if self.ctx_info.step['name'] == "cleanup":
+                            delivery_reformat.knobs()["format"].setValue(delivery_format)
+                            crop_box_value = (0,0, delivery_format.width(), delivery_format.height())
+                            format_crop['box'].setValue(crop_box_value)                                              
+                            delivery_reformat['disable'].setValue(True)  
+                            format_crop['disable'].setValue(True)
+                        else:
+                            delivery_reformat.knobs()["format"].setValue(delivery_format)
+                            crop_box_value = (0,0, delivery_format.width(), delivery_format.height())
+                            format_crop['box'].setValue(crop_box_value)
+                            delivery_reformat['disable'].setValue(False)    
+                            format_crop['disable'].setValue(False)
+
+            color_space = None      
+            
+            if self.proj_info['sg_color_space']:
+                if self.proj_info['sg_color_space'] == "raw":
+                    node['raw'].setValue(True)
+                else:
+                    color_space = self.proj_info['sg_color_space']
+            else:
+                color_space = next((color for color in node.knob('colorspace').values() if 'default' in color), None)
+            
+            if color_space:
+                node['colorspace'].setValue(color_space)
+
+            md = content_meta_data['metadata']
+            md.fromScript(self.__get_metadata(node))
+
+        elif self._app.context.entity['type'] == 'Asset':
+            # Update embeded time code
+            delivery_reformat = node.node(TankWriteNodeHandler.EMBED_DELIVERY_REFORMAT)
+            internal_shuffle = node.node(TankWriteNodeHandler.EMBED_SHUFFLE)
+            format_crop = node.node(TankWriteNodeHandler.EMBED_FORMAT_CROP)            
+            content_meta_data = node.node(TankWriteNodeHandler.EMBED_META_DATA)        
+            matte_clamp = node.node(TankWriteNodeHandler.EMBED_MATTE_CLAMP)
+            proj_fps = self.proj_info['sg_frame_rate']
+            
+            # Set the embeded delivery reformat 
+            if not (self.proj_info['sg_delivery_format_width'] and 
+            self.proj_info['sg_delivery_format_height']):
+                delivery_reformat['disable'].setValue(True)  
+                node.node("format_crop")['disable'].setValue(True)                  
+                
+                nuke.tprint("No delivery reformat info given on Projects.")
+            else:       
+                # Set the project reformat first
+                delivery_format = self.add_format(self.proj_info['sg_short_name'],
+                                                "delivery",
+                                                int(self.proj_info['sg_delivery_format_width']), 
+                                                int(self.proj_info['sg_delivery_format_height']), 
+                                                int(self.proj_info['sg_pixel_aspect_ratio']))
+                     
+                if write_type != "Version":
+                    delivery_reformat['disable'].setValue(True)
+                    node.node("format_crop")['disable'].setValue(True)
+                else:
+                    # Add SG reformat settings
+                    filter_match = next((f for f in delivery_reformat['filter'].values() if f == self.proj_info['sg_delivery_reformat_filter']), None)
+                    if filter_match:
+                        delivery_reformat['filter'].setValue(filter_match)                        
+                    resize_match = next((r for r in delivery_reformat['resize'].values() if r == self.proj_info['sg_delivery_reformat_type']), None)
+                    if resize_match:
+                        delivery_reformat['resize'].setValue(resize_match)
+               
+                    # Set the delivery_reformat node
+                    delivery_reformat.knobs()["format"].setValue(delivery_format)
+                    crop_box_value = (0,0, delivery_format.width(), delivery_format.height())
+                    format_crop['box'].setValue(crop_box_value)
+                    delivery_reformat['disable'].setValue(False)  
+                    format_crop['disable'].setValue(False)  
+                color_space = None      
+                # Set colorspace based of SG values
+                color_space = "linear"          
+                self.__embedded_format_option(node, False) 
+
+                node['colorspace'].setValue(color_space)
+
+            md = content_meta_data['metadata']
+            md.fromScript(self.__get_metadata(node))
+
         # Reset the render path but only if the named profile has changed - this will only
         # be the case if the user has changed the profile through the UI so this will avoid
         # the node automatically updating without the user's knowledge.
         if profile_name != old_profile_name:
             self.reset_render_path(node)
+
+        # A slew of roto-specific changes
+        if self.ctx_info.step['id'] == 3:
+            # set auto crop
+            profile_channel = "all"
+            node.knob('auto_crop').setVisible(True)
+            node.knob('auto_crop').setValue(True)
+
+            # Set colorspace based of SG values  
+            self.__embedded_format_option(node, False) 
+
+            if profile_name == "Exr":
+                node.node("Write1").knob("autocrop").setValue(True)
+
+            # set data type
+            if write_type == "Version":
+                # nuke.tprint("Task context is %s. Applying ZIP compression to %s output." % ( self.ctx_info.step['name'], write_type ) )
+                self.__update_knob_value(node, 'exr_datatype', '16 bit half')
+
+                # set compression
+                file_settings.update({'compression' : 'Zip (1 scanline)'})
+                file_settings.update({'datatype' : '16 bit half'})
+
+                self.__update_knob_value(node, "tk_profile_list", "Exr")
+                self.__update_knob_values(node, "write_type", ['Version', 'Denoise', 'Element'])
+                node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setEnabled(True)
+                self.__embedded_format_option(node, False)
+
+                # self.__set_project_crop(node, False)
+            else:
+                self.__update_knob_value(node, 'exr_datatype', exr_datayype)
+                file_settings.update({'compression' : 'none'})
+                file_settings.update({'datatype' : exr_datayype})
+
+    def __get_metadata(self, node):
+        # Set meta data info
+        user_name = ""
+        step_name = ""
+        script_name = ""
+        computer_name = os.getenv('COMPUTERNAME')
+
+        try:
+            user_name = self.ctx_info.user['name'].replace(' ', '_')
+            step_name = self.ctx_info.step['name']
+        except:
+            self._app.log_debug("Failed to gt context info for meta data.")
+        if nuke.root():
+            script_name = os.path.split(nuke.root().name())[1]            
+        metadata_info = "{set artist_name %s}\n" % user_name
+        metadata_info += "{set computer_name %s}\n" % computer_name        
+        metadata_info += "{set script_name %s}\n" % script_name 
+        metadata_info += "{set write_node %s}\n" % node.name()  
+        metadata_info += "{set pipeline_step %s}\n" %   step_name        
+        
+        return metadata_info
 
     def __populate_initial_output_name(self, template, node):
         """
@@ -1247,33 +1956,33 @@ class TankWriteNodeHandler(object):
             # Nothing to do!
             return
 
-        if output_default is None:
-            # no default name - use hard coded built in
-            output_default = "output"
+        # if output_default is None:
+        #     # no default name - use hard coded built in
+        #     output_default = "output"
 
-        # get the output names for all other nodes that are using the same profile
-        used_output_names = set()
-        node_profile = self.get_node_profile_name(node)
-        for n in self.get_nodes():
-            if n != node and self.get_node_profile_name(n) == node_profile:
-                used_output_names.add(
-                    n.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).value()
-                )
+        # # get the output names for all other nodes that are using the same profile
+        # used_output_names = set()
+        # node_profile = self.get_node_profile_name(node)
+        # for n in self.get_nodes():
+        #     if n != node and self.get_node_profile_name(n) == node_profile:
+        #         used_output_names.add(
+        #             n.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).value()
+        #         )
 
-        # handle if output is optional:
-        if output_is_optional and "" not in used_output_names:
-            # default should be an empty string:
-            output_default = ""
+        # # handle if output is optional:
+        # if output_is_optional and "" not in used_output_names:
+        #     # default should be an empty string:
+        #     output_default = ""
 
-        # now ensure output name is unique:
-        postfix = 1
-        output_name = output_default
-        while output_name in used_output_names:
-            output_name = "%s%d" % (output_default, postfix)
-            postfix += 1
+        # # now ensure output name is unique:
+        # postfix = 1
+        # output_name = output_default
+        # while output_name in used_output_names:
+        #     output_name = "%s%d" % (output_default, postfix)
+        #     postfix += 1
 
-        # finally, set the output name on the knob:
-        node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setValue(output_name)
+        # # finally, set the output name on the knob:
+        # node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setValue(output_name)
 
     def __populate_format_settings(
         self,
@@ -1436,6 +2145,18 @@ class TankWriteNodeHandler(object):
         if this_line:
             lines.append(this_line)
         return lines
+
+    def __read_node_metadata(self, read_path):
+        read_path = read_path.replace('\\','/')
+        read_metadata = nuke.nodes.Read(file="%s" %(read_path))
+        read_metadata['file'].setValue(read_path)
+        read_metadata_info = read_metadata.metadata()
+        nuke.delete(read_metadata)
+
+        try:
+            return read_metadata_info
+        except:
+            return None
 
     def __update_render_path(self, node, force_reset=False, is_proxy=False):
         """
@@ -1697,7 +2418,7 @@ class TankWriteNodeHandler(object):
                 # ignore
                 pass
 
-        return path
+        return os.path.normpath(path)
 
     def __get_files_on_disk(self, node, is_proxy=False):
         """
@@ -1705,7 +2426,8 @@ class TankWriteNodeHandler(object):
         Returns the files on disk associated with this node
         """
         file_name = self.__get_render_path(node, is_proxy)
-        template = self.__get_render_template(node, is_proxy, fallback_to_render=True)
+        write_type = self.get_node_write_type_name(node)        
+        template = self.__get_render_template(node, write_type, is_proxy, fallback_to_render=True)
 
         if not template.validate(file_name):
             raise Exception(
@@ -1718,7 +2440,7 @@ class TankWriteNodeHandler(object):
         # make sure we don't look for any eye - %V or SEQ - %04d stuff
         frames = self._app.tank.paths_from_template(template, fields, ["SEQ", "eye"])
 
-        return frames
+        return (frames, fields)
 
     def __calculate_proxy_dimensions(self, node):
         """
@@ -1781,7 +2503,8 @@ class TankWriteNodeHandler(object):
         :param is_proxy:     If True then compute the proxy path, otherwise compute the standard render path
         :returns:            Tuple containing (render template, width, height, output name)
         """
-        render_template = self.__get_render_template(node, is_proxy)
+        write_type = self.get_node_write_type_name(node)        
+        render_template = self.__get_render_template(node, write_type, is_proxy)
         width = height = 0
         output_name = ""
 
@@ -1828,7 +2551,7 @@ class TankWriteNodeHandler(object):
         )
 
     def __compute_render_path_from(
-        self, node, render_template, width, height, output_name
+        self, node, render_template, width, height, output_name, next_version= 1
     ):
         """
         Computes the render path for a node using the specified settings
@@ -1840,6 +2563,9 @@ class TankWriteNodeHandler(object):
         :param output_name:        The toolkit output name specified by the user for this node
         :returns:                  The computed render path
         """
+
+        # Get write type
+        write_type = self.get_node_write_type_name(node)
 
         # make sure we have a valid template:
         if not render_template:
@@ -1859,6 +2585,9 @@ class TankWriteNodeHandler(object):
             and self._script_template.validate(curr_filename)
         ):
             fields = self._script_template.get_fields(curr_filename)
+            if write_type in ["Version", "Test"]:
+                pass
+
         if not fields:
             raise TkComputePathError("The current script is not a Shotgun Work File!")
 
@@ -1923,9 +2652,9 @@ class TankWriteNodeHandler(object):
         would be different to the cached path ignoring the width & height fields.
         """
         # get the render template:
-        render_template = self.__get_render_template(
-            node, is_proxy, fallback_to_render=True
-        )
+        write_type = self.get_node_write_type_name(node)
+        render_template = self.__get_render_template(node, write_type, is_proxy, fallback_to_render=True)
+
         if not render_template:
             return True
 
@@ -1947,7 +2676,7 @@ class TankWriteNodeHandler(object):
                 # get the new fields from the render path and compare:
                 new_fields = render_template.get_fields(render_path)
 
-                path_is_locked = len(new_fields) != len(prev_fields)
+                path_is_locked = (len(new_fields) != len(prev_fields))
                 if not path_is_locked:
                     for name, value in new_fields.iteritems():
                         if name not in prev_fields:
@@ -1985,6 +2714,10 @@ class TankWriteNodeHandler(object):
         if not isinstance(node, nuke.Gizmo):
             return
 
+        if self.__is_node_fully_constructed(node):
+            # node has already been constructed for this session!
+            return
+
         self._app.log_debug("Setting up new node...")
 
         # reset the construction flag to ensure that
@@ -2014,16 +2747,19 @@ class TankWriteNodeHandler(object):
             # sure we reset all settings
             reset_all_profile_settings = True
 
-        # ensure that the correct entry is selected from the list:
-        self.__update_knob_value(node, "tk_profile_list", current_profile_name)
-        # and make sure the node is up-to-date with the profile:
-        self.__set_profile(
-            node, current_profile_name, reset_all_settings=reset_all_profile_settings
-        )
+        # ### ADD WRITE TYPE INFO???
 
-        # ensure that the disable value properly propogates to the internal write node:
-        write_node = node.node(TankWriteNodeHandler.WRITE_NODE_NAME)
-        write_node["disable"].setValue(node["disable"].value())
+
+        # # ensure that the correct entry is selected from the list:
+        # self.__update_knob_value(node, "tk_profile_list", current_profile_name)
+        # # and make sure the node is up-to-date with the profile:
+        # self.__set_profile(
+        #     node, current_profile_name, reset_all_settings=reset_all_profile_settings
+        # )
+
+        # # ensure that the disable value properly propogates to the internal write node:
+        # write_node = node.node(TankWriteNodeHandler.WRITE_NODE_NAME)
+        # write_node["disable"].setValue(node["disable"].value())
 
         # Ensure that the output name matches the node name if
         # that option is enabled on the node. This is primarily
@@ -2036,6 +2772,46 @@ class TankWriteNodeHandler(object):
             # force output name to be the node name:
             new_output_name = node.knob("name").value()
             self.__set_output(node, new_output_name)
+
+        # now that the node is constructed, we can process
+        # knob changes correctly.
+        self.__set_final_construction_flag(node, True)
+
+        # set the write type for creation of correct output
+        write_type = self.get_node_write_type_name(node)        
+        if self._app.context.entity['type'] == 'Shot':
+            if (self.proj_info['name'] != "Breakdowns" and write_type == "Version"):                                     
+                node.knob('convert_to_write').setVisible(False) 
+                node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setEnabled(False)                       
+                if node['tk_project_format_cache'].value() == "False":
+                    self.__embedded_format_option(node, False)                               
+                elif node['tk_project_format_cache'].value() == "True":
+                    self.__embedded_format_option(node, True)   
+                else:    
+                    self.__embedded_format_option(node, True)
+        elif self._app.context.entity['type'] == 'Asset':
+            if write_type == "Version":
+                node.knob('convert_to_write').setVisible(False)
+
+                if node['tk_project_format_cache'].value() == "False":
+                    self.__embedded_format_option(node, False)
+
+                elif node['tk_project_format_cache'].value() == "True":
+                    self.__embedded_format_option(node, True)
+
+                else:    
+                    self.__embedded_format_option(node, True)
+
+                node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setEnabled(False)      
+        # ensure that the correct entry is selected from the list:
+        self.__update_knob_value(node, "tk_profile_list", current_profile_name)
+        # and make sure the node is up-to-date with the profile:
+        # nuke.tprint(">>>>> FLAG BBBBB")
+        self.__set_profile(node, current_profile_name, write_type, reset_all_settings=reset_all_profile_settings)
+                   
+        # ensure that the disable value properly propogates to the internal write node:
+        write_node = node.node(TankWriteNodeHandler.WRITE_NODE_NAME)
+        write_node["disable"].setValue(node["disable"].value())
 
         # now that the node is constructed, we can process
         # knob changes correctly.
@@ -2067,6 +2843,40 @@ class TankWriteNodeHandler(object):
 
         return node.knob("tk_is_fully_constructed").value()
 
+    def __write_type_changed(self, node, detail_enabled):#, profile_type, channel_type):
+        # Profile input
+        # write_type_profile  =   profile_type
+        # profile_channels    =   channel_type
+        # Detail input
+        self.__update_knob_value(node, TankWriteNodeHandler.OUTPUT_KNOB_NAME, "")   
+
+        node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setEnabled(detail_enabled)
+
+    def __test_write_message(self):
+        # Pop warning that the renders saved to the Test location 
+
+        user_name = self._app.context.user['name'].split()
+        nuke.message(
+            "%s!" % str(user_name[0]) + "\n"
+            "\n"
+            "Please be aware that this is a temporary location.\n"
+            "Renders saved here will be removed at the end of the week.\n")
+    
+    def __embedded_format_option(self, node, value):
+        if value == True:
+            node.node("delivery_reformat")['disable'].setValue(False)
+            node.node("format_crop")['disable'].setValue(False)
+
+        elif value == False:
+            node.node("delivery_reformat")['disable'].setValue(True)    
+            node.node("format_crop")['disable'].setValue(True)
+
+    def __set_project_crop_cache(self, node, bool_value):
+        if bool_value == True:   
+            node['tk_project_format_cache'].setValue("True")
+        elif bool_value == False:
+            node['tk_project_format_cache'].setValue("False")
+
     def __on_knob_changed(self):
         """
         Callback that gets called whenever the value for a knob on a Shotgun Write
@@ -2087,6 +2897,14 @@ class TankWriteNodeHandler(object):
             # print "Ignoring change to %s.%s value = %s" % (node.name(), knob.name(), knob.value())
             return
 
+        # Set project fileset based on SG info
+        write_type = self.get_node_write_type_name(node)
+        write_type_profile = "Exr"
+        if self.proj_info['sg_delivery_fileset'] != None:
+            if write_type == "Version":
+                write_type_profile = self.proj_info['sg_delivery_fileset']['name'].capitalize()
+
+        # Main handler area for knob changed
         if knob.name() == "tk_profile_list":
             # change the profile for the specified node:
             new_profile_name = knob.value()
@@ -2095,6 +2913,11 @@ class TankWriteNodeHandler(object):
         elif knob.name() == TankWriteNodeHandler.OUTPUT_KNOB_NAME:
             # internal cached output has been changed!
             new_output_name = knob.value()
+            if (not new_output_name or
+            write_type == 'Version'):
+                pass
+            else:
+                node['name'].setValue(write_type+"_"+str(new_output_name))
             if node.knob(TankWriteNodeHandler.USE_NAME_AS_OUTPUT_KNOB_NAME).value():
                 # force output name to be the node name:
                 new_output_name = node.knob("name").value()
@@ -2102,9 +2925,10 @@ class TankWriteNodeHandler(object):
 
         elif knob.name() == "name":
             # node name has changed:
-            if node.knob(TankWriteNodeHandler.USE_NAME_AS_OUTPUT_KNOB_NAME).value():
-                # set the output to the node name:
-                self.__set_output(node, knob.value())
+            if write_type != "Version":
+                if node.knob(TankWriteNodeHandler.USE_NAME_AS_OUTPUT_KNOB_NAME).value():
+                    # set the output to the node name:
+                    self.__set_output(node, knob.value())
 
         elif knob.name() == TankWriteNodeHandler.USE_NAME_AS_OUTPUT_KNOB_NAME:
             # checkbox controlling if the name should be used as the output has been toggled
@@ -2115,6 +2939,133 @@ class TankWriteNodeHandler(object):
             if name_as_output:
                 # update output to reflect the node name:
                 self.__set_output(node, node.knob("name").value())
+        elif knob.name() == "write_type":
+            if self._app.context.entity['type'] == 'Shot':
+                if write_type == "Version":
+                    node.knob('convert_to_write').setVisible(False)  
+                    # self.__set_project_crop(node, True)
+                    self.__write_type_changed(node, False)
+                    self.__embedded_format_option(node, True)      
+                    # if self.ctx_info.step['id'] == 3:
+                    #     self.__set_project_crop(node, False)
+                    if write_type_profile == "Dpx":
+                        node.node("Write1").knob("transfer").setValue('(auto detect)')      
+                elif write_type == "Test":
+                    # self.__set_project_crop(node, False)
+                    self.__write_type_changed(node, True)
+                    self.__test_write_message()
+                    self.__embedded_format_option(node, False)
+                else:
+                    node.knob('convert_to_write').setVisible(True) 
+                    # self.__set_project_crop(node, False)
+                    self.__write_type_changed(node, True)
+                    write_type_profile = "Exr"   
+                    self.__embedded_format_option(node, False)
+                    try:
+                        node.node("Write1").knob("autocrop").setValue(True)
+                    except:
+                        pass
+
+                # Scans script for existing name clashes and renames accordingly
+                existing_node_names = [n.name() for n in nuke.allNodes(group=nuke.root())]
+                new_output_name = ""
+                unique_name = self.__ensure_unique_name(knob.value(), existing_node_names)
+                node.knob("name").setValue(unique_name)
+                        
+                self.__set_output(node, new_output_name)
+                # Updates the predefined profile based on the write type
+                self.__update_knob_value(node, "tk_profile_list", write_type_profile)                 
+                # reset profile
+                # nuke.tprint(">>>>> FLAG DDDDD")
+                self.__set_profile(node, write_type_profile, write_type, reset_all_settings=True)
+            elif self._app.context.entity['type'] == 'Asset':
+                if write_type== "Version":
+                    node.knob('convert_to_write').setVisible(False)  
+                    # self.__set_project_crop(node, True)
+                    self.__write_type_changed(node, False)
+                    self.__embedded_format_option(node, True)      
+                    # if self.ctx_info.step['id'] == 3:
+                    #     self.__set_project_crop(node, False)
+                    if write_type_profile == "Dpx":
+                        node.node("Write1").knob("transfer").setValue('(auto detect)')     
+                    self.__update_knob_value(node, TankWriteNodeHandler.OUTPUT_KNOB_NAME, "")   
+                    node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setEnabled(True)
+                elif write_type == "Test":
+                    # self.__set_project_crop(node, False)
+                    self.__write_type_changed(node, True)
+                    self.__embedded_format_option(node, False)
+                    self.__update_knob_value(node, TankWriteNodeHandler.OUTPUT_KNOB_NAME, "")   
+                    node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setEnabled(True)                 
+                    self.__test_write_message()
+                elif write_type == "Element":
+                    node.knob('convert_to_write').setVisible(True) 
+                    # self.__set_project_crop(node, False)
+                    self.__write_type_changed(node, True)
+                    write_type_profile = "Exr"   
+                    self.__embedded_format_option(node, False)
+                    try:
+                        node.node("Write1").knob("autocrop").setValue(True)
+                    except:
+                        pass
+                    self.__update_knob_value(node, TankWriteNodeHandler.OUTPUT_KNOB_NAME, "")   
+                    node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setEnabled(True)
+                    write_type_profile =  "Exr"
+                else:
+                    node.knob('convert_to_write').setVisible(True) 
+                    # self.__set_project_crop(node, False)
+                    self.__write_type_changed(node, True)
+                    write_type_profile = "Exr"   
+                    self.__embedded_format_option(node, False)
+                    try:
+                        node.node("Write1").knob("autocrop").setValue(True)
+                    except:
+                        pass
+                    self.__update_knob_value(node, TankWriteNodeHandler.OUTPUT_KNOB_NAME, "")   
+                    node.knob(TankWriteNodeHandler.OUTPUT_KNOB_NAME).setEnabled(False)
+                existing_node_names = [n.name() for n in nuke.allNodes(group=nuke.root())]
+                new_output_name = ""
+                self.__ensure_unique_name(node.name(), existing_node_names)
+                self.__set_output(node, new_output_name)
+                # Updates the predefined profile based on the write type
+                self.__update_knob_value(node, "tk_profile_list", write_type_profile)                 
+                # reset profile
+                # nuke.tprint(">>>>> FLAG EEEEE")
+                self.__set_profile(node, write_type_profile, write_type, reset_all_settings=True)
+
+        elif knob.name() == "write_type_info":
+            write_type_url = "http://10.80.8.252/ssvfx-wiki-sphinx/workflow/nuke/nuke.html#sg-write-node"
+            webbrowser.open_new_tab(write_type_url)     
+        elif knob.name() == "check_mattes":
+            
+            if not ntools:
+                nuke.tprint("Could not find NukeTools") 
+            else:
+                                                                
+                try:
+                    ntools.test_channels(node, self.shot_info, ['rgb', 'rgba'])
+                except:
+                    pass
+        
+        elif knob.name() == "project_crop_bool":   
+            self.__embedded_format_option(node, knob.value())
+            self.__set_project_crop_cache(node, knob.value())        
+        elif knob.name() == "exr_datatype":   
+            try:
+                node.node("Write1").knob("datatype").setValue(knob.value())
+            except:
+                pass
+        elif knob.name() == "dpx_datatype":   
+            try:
+                node.node("Write1").knob("datatype").setValue(knob.value())            
+            except:
+                pass
+        elif knob.name() == "convert_to_write":
+            self.convert_sg_to_nuke_write_nodes(selected_node=node)                
+        elif knob.name() == "auto_crop":
+            try:
+                node.node("Write1").knob("autocrop").setValue(knob.value())
+            except:
+                pass            
 
         else:
             # Propogate changes to certain knobs from the gizmo/group to the
@@ -2139,6 +3090,14 @@ class TankWriteNodeHandler(object):
                 )
 
                 write_node.knob(knob_name).setValue(nuke.thisKnob().value())
+
+                node_channel = node['channels'].value()
+        
+        # Add channels info to cahce for reopen reference
+        try:
+            node['channels_cache'].setValue(node_channel)
+        except:
+            pass
 
     def __get_current_script_path(self):
         """
@@ -2218,7 +3177,9 @@ class TankWriteNodeHandler(object):
             )
             knob_changes = pickle.dumps(nk_data)
             self.__update_knob_value(
-                n, "tk_write_node_settings", unicode(base64.b64encode(knob_changes)),
+                n, 
+                "tk_write_node_settings",
+                unicode(base64.b64encode(knob_changes)),
             )
 
     def __on_user_create(self):
@@ -2238,5 +3199,51 @@ class TankWriteNodeHandler(object):
         self.setup_new_node(node)
 
         # populate the initial output name based on the render template:
-        render_template = self.get_render_template(node)
+        write_type = self.get_node_write_type_name(node)        
+        render_template = self.get_render_template(node, write_type)
         self.__populate_initial_output_name(render_template, node)
+
+    def __hide_UI(self, node, ui_name_array, visibility):
+        if not ui_name_array:
+            return
+        else: 
+            for i in ui_name_array:
+                k = node.knob(i)
+                if k:
+                    k.setVisible(visibility)
+
+    def __disable_UI(self, node, ui_name_array, enabled):
+        if not ui_name_array:
+            return
+        else: 
+            for i in ui_name_array:
+                k = node.knob(i)
+                k.setEnabled(enabled)
+
+    def __update_knob_values(self, node, name, values_list):
+        if not values_list:
+            return None     
+        else:
+            k = node.knob(name)
+            if k.values != values_list:
+                k.setValues(values_list)
+
+    def __ensure_unique_name(self, name, existing_node_names):
+        # rename to our new default name:
+        postfix = 1
+        while True:
+            new_name = "%s%d" % (name, postfix)
+            if new_name not in existing_node_names:
+                return new_name
+                break
+            else:
+                postfix += 1  
+
+    def __get_list_index(self, the_list, item_name):
+        if the_list:
+            if item_name in the_list:
+                return the_list.index(item_name)
+            else:
+                nuke.tprint ("Couldn't find the given item_name in list")
+                return 0    
+
