@@ -307,7 +307,6 @@ class TankWriteNodeHandler(object):
         self._app.log_debug("Created Shotgun Write Node %s" % node.name())
 
         # set the profile:
-        # nuke.tprint(">>>>> FLAG AAAAA")
         self.__set_profile(node, profile_name, write_type, reset_all_settings=True)
 
         nuke.tprint( "Created %s Node %s" % ( node['tk_profile_list'].value(), node.name() ) )
@@ -447,7 +446,7 @@ class TankWriteNodeHandler(object):
             self.__on_user_create, nodeClass=TankWriteNodeHandler.SG_WRITE_NODE_CLASS
         )
 
-def create_project_settings_group(self, node):
+    def create_project_settings_group(self, node):
         # Get properties of selected node to use for new group
         nodePos = (node.xpos(), node.ypos())
         existing_node_names = [n.name() for n in nuke.allNodes("Group")]
@@ -2806,7 +2805,6 @@ def create_project_settings_group(self, node):
         # ensure that the correct entry is selected from the list:
         self.__update_knob_value(node, "tk_profile_list", current_profile_name)
         # and make sure the node is up-to-date with the profile:
-        # nuke.tprint(">>>>> FLAG BBBBB")
         self.__set_profile(node, current_profile_name, write_type, reset_all_settings=reset_all_profile_settings)
                    
         # ensure that the disable value properly propogates to the internal write node:
@@ -2838,6 +2836,16 @@ def create_project_settings_group(self, node):
         mechanism allows the code to ignore other callbacks that may fail because things aren't set
         up correctly (e.g. knobChanged calls for default values when loading a script).
         """
+
+        # # Try/except to catch python object detachment error
+        # try:
+        #     if not node.knob("tk_is_fully_constructed"):
+        #         return False
+        # except:
+        #     return False
+
+        # nuke.tprint( "    >>>>> __is_node_fully_constructed called by: %s" % sys._getframe().f_back.f_code.co_name )
+
         if not node.knob("tk_is_fully_constructed"):
             return False
 
@@ -2889,6 +2897,8 @@ def create_project_settings_group(self, node):
         knob = nuke.thisKnob()
         grp = nuke.thisGroup()
 
+        # nuke.tprint(">>>>> Caller Knob Name: %s" % knob.name())
+
         if not self.__is_node_fully_constructed(node):
             # knobChanged will be called during script load for all knobs with non-default
             # values.  We want to ignore these implicit changes so we make use of a knob to
@@ -2908,7 +2918,7 @@ def create_project_settings_group(self, node):
         if knob.name() == "tk_profile_list":
             # change the profile for the specified node:
             new_profile_name = knob.value()
-            self.__set_profile(node, new_profile_name, reset_all_settings=True)
+            self.__set_profile(node, new_profile_name, write_type, reset_all_settings=True)
 
         elif knob.name() == TankWriteNodeHandler.OUTPUT_KNOB_NAME:
             # internal cached output has been changed!
@@ -2976,7 +2986,6 @@ def create_project_settings_group(self, node):
                 # Updates the predefined profile based on the write type
                 self.__update_knob_value(node, "tk_profile_list", write_type_profile)                 
                 # reset profile
-                # nuke.tprint(">>>>> FLAG DDDDD")
                 self.__set_profile(node, write_type_profile, write_type, reset_all_settings=True)
             elif self._app.context.entity['type'] == 'Asset':
                 if write_type== "Version":
@@ -3029,7 +3038,6 @@ def create_project_settings_group(self, node):
                 # Updates the predefined profile based on the write type
                 self.__update_knob_value(node, "tk_profile_list", write_type_profile)                 
                 # reset profile
-                # nuke.tprint(">>>>> FLAG EEEEE")
                 self.__set_profile(node, write_type_profile, write_type, reset_all_settings=True)
 
         elif knob.name() == "write_type_info":
