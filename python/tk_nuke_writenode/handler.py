@@ -77,9 +77,11 @@ class TankWriteNodeHandler(object):
         self.populate_profiles_from_settings()
 
         self.sg = self._app.engine.shotgun
+        self.ctx_info = self._app.context  
+
         self.entity_info = self.sg.find_one(
-                                    "Shot", 
-                                    [['id', 'is', self._app.context.entity['id']]],
+                                    "%s" % self.ctx_info.entity['type'], 
+                                    [['id', 'is', self.ctx_info.entity['id']]],
                                     ['name',
                                     'id',
                                     'sg_main_plate',
@@ -103,8 +105,7 @@ class TankWriteNodeHandler(object):
 
         self.proj_info = { k.split(".")[-1]: self.entity_info[k] for k in self.entity_info if "project.Project" in k }                                   
         self.shot_info = { k: self.entity_info[k] for k in self.entity_info if "project.Project" not in k }                                   
-
-        self.ctx_info = self._app.context                                               
+                                              
         self.get_shot_frame_range()
 
     ################################################################################################
@@ -1697,7 +1698,7 @@ class TankWriteNodeHandler(object):
 
         context = self._app.context.entity['type']
         if context != 'Asset':
-            if not self.shot_info['sg_shot_mattes']:
+            if not self.shot_info.get('sg_shot_mattes'):
                 profile_channel = "rgb"
             else:
                 nuke.tprint("Found assigned mattes on SG. Setting channels to all")
